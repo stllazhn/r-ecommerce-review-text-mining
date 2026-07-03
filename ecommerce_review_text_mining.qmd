@@ -1,0 +1,1447 @@
+---
+title: "new_project_draft"
+format: html
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(tidytext)
+library(stringr)
+library(ggplot2)
+library(broom)
+library(cluster)
+library(knitr)
+library(Matrix)
+library(irlba)
+library(scales)
+library(forcats)
+library(MASS)
+```
+
+```{r load-and-clean-data}
+reviews <- readr::read_csv("Womens Clothing E-Commerce Reviews.csv")
+
+df2 <- reviews %>%
+  dplyr::mutate(
+    review_id = dplyr::row_number(),
+    `Review Text` = as.character(`Review Text`),
+    Age = as.numeric(Age),
+    Rating = as.numeric(Rating),
+    `Positive Feedback Count` = as.numeric(`Positive Feedback Count`),
+    `Recommended IND` = dplyr::case_when(
+      `Recommended IND` %in% c(1, "1", TRUE, "TRUE", "True") ~ 1L,
+      `Recommended IND` %in% c(0, "0", FALSE, "FALSE", "False") ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    `Department Name` = as.character(`Department Name`)
+  ) %>%
+  dplyr::filter(!is.na(`Review Text`), stringr::str_trim(`Review Text`) != "") %>%
+  dplyr::mutate(
+    review_text_clean = stringr::str_squish(`Review Text`),
+    word_count = stringr::str_count(review_text_clean, stringr::boundary("word")),
+    char_count = stringr::str_length(review_text_clean)
+  ) %>%
+  dplyr::select(
+    review_id,
+    `Review Text`,
+    Rating,
+    `Recommended IND`,
+    `Positive Feedback Count`,
+    Age,
+    `Department Name`,
+    review_text_clean,
+    word_count,
+    char_count
+  )
+
+clean_df <- df2 %>%
+  dplyr::select(review_id, review_text_clean) %>%
+  tidytext::unnest_tokens(word, review_text_clean) %>%
+  dplyr::anti_join(tidytext::stop_words, by = "word") %>%
+  dplyr::filter(
+    !is.na(word),
+    word != "",
+    !stringr::str_detect(word, "^[0-9]+$"),
+    stringr::str_detect(word, "[a-z]"),
+    stringr::str_length(word) >= 3
+  ) %>%
+  dplyr::select(review_id, word)
+```
+
+```{r standardize-inputs}
+required_df2_cols <- c(
+  "review_id",
+  "Review Text",
+  "Rating",
+  "Recommended IND",
+  "Positive Feedback Count",
+  "Age",
+  "Department Name",
+  "word_count",
+  "char_count"
+)
+
+required_clean_cols <- c("review_id", "word")
+
+missing_df2 <- setdiff(required_df2_cols, names(df2))
+missing_clean <- setdiff(required_clean_cols, names(clean_df))
+
+if (length(missing_df2) > 0) {
+  stop(paste("df2 is missing:", paste(missing_df2, collapse = ", ")))
+}
+
+if (length(missing_clean) > 0) {
+  stop(paste("clean_df is missing:", paste(missing_clean, collapse = ", ")))
+}
+
+df2 <- df2 %>%
+  dplyr::mutate(
+    review_id = as.character(review_id),
+    `Recommended IND` = dplyr::case_when(
+      `Recommended IND` %in% c(1, "1", TRUE, "TRUE", "True") ~ 1L,
+      `Recommended IND` %in% c(0, "0", FALSE, "FALSE", "False") ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  )
+
+clean_df <- clean_df %>%
+  dplyr::mutate(
+    review_id = as.character(review_id),
+    word = as.character(word)
+  ) %>%
+  dplyr::filter(!is.na(review_id), !is.na(word), word != "")
+```
+
+```{r eda-overview}
+cat("Rows in df2:", nrow(df2), "\n")
+cat("Columns in df2:", ncol(df2), "\n")
+
+glimpse(df2)
+
+missing_summary <- tibble::tibble(
+  variable = names(df2),
+  missing_count = sapply(df2, function(x) sum(is.na(x))),
+  missing_percent = round(100 * missing_count / nrow(df2), 2)
+) %>%
+  dplyr::arrange(dplyr::desc(missing_count))
+
+missing_summary %>%
+  knitr::kable(caption = "Missingness Summary for Cleaned Review-Level Data")
+```
+
+```{r eda-distributions}
+rating_balance <- df2 %>%
+  dplyr::count(Rating) %>%
+  dplyr::mutate(proportion = n / sum(n))
+
+recommend_balance <- df2 %>%
+  dplyr::count(`Recommended IND`) %>%
+  dplyr::mutate(
+    recommendation = dplyr::case_when(
+      `Recommended IND` == 1 ~ "Recommended",
+      `Recommended IND` == 0 ~ "Not Recommended",
+      TRUE ~ "Missing"
+    ),
+    proportion = n / sum(n)
+  ) %>%
+  dplyr::select(recommendation, n, proportion)
+
+department_balance <- df2 %>%
+  dplyr::count(`Department Name`, sort = TRUE) %>%
+  dplyr::mutate(proportion = n / sum(n))
+
+rating_balance %>% knitr::kable(caption = "Distribution of Ratings")
+recommend_balance %>% knitr::kable(caption = "Distribution of Recommendation Status")
+department_balance %>% knitr::kable(caption = "Distribution of Reviews by Department")
+```
+
+```{r eda-plots-1, fig.width=8, fig.height=5}
+ggplot2::ggplot(rating_balance, ggplot2::aes(x = factor(Rating), y = proportion)) +
+  ggplot2::geom_col() +
+  ggplot2::scale_y_continuous(labels = scales::percent_format()) +
+  ggplot2::labs(
+    title = "Proportion of Reviews by Rating",
+    x = "Rating",
+    y = "Proportion"
+  ) +
+  ggplot2::theme_minimal()
+```
+
+```{r eda-plots-2, fig.width=8, fig.height=5}
+ggplot2::ggplot(department_balance, ggplot2::aes(x = reorder(`Department Name`, n), y = n)) +
+  ggplot2::geom_col() +
+  ggplot2::coord_flip() +
+  ggplot2::labs(
+    title = "Number of Reviews by Department",
+    x = "Department",
+    y = "Count"
+  ) +
+  ggplot2::theme_minimal()
+```
+
+```{r eda-length-summary}
+length_quantiles <- df2 %>%
+  dplyr::summarise(
+    word_q25 = quantile(word_count, 0.25, na.rm = TRUE),
+    word_q50 = quantile(word_count, 0.50, na.rm = TRUE),
+    word_q75 = quantile(word_count, 0.75, na.rm = TRUE),
+    word_q90 = quantile(word_count, 0.90, na.rm = TRUE),
+    word_q95 = quantile(word_count, 0.95, na.rm = TRUE),
+    word_q99 = quantile(word_count, 0.99, na.rm = TRUE),
+    char_q25 = quantile(char_count, 0.25, na.rm = TRUE),
+    char_q50 = quantile(char_count, 0.50, na.rm = TRUE),
+    char_q75 = quantile(char_count, 0.75, na.rm = TRUE),
+    char_q90 = quantile(char_count, 0.90, na.rm = TRUE),
+    char_q95 = quantile(char_count, 0.95, na.rm = TRUE),
+    char_q99 = quantile(char_count, 0.99, na.rm = TRUE)
+  )
+
+length_quantiles %>% knitr::kable(caption = "Quantiles for Review Length")
+```
+
+```{r eda-plots-3, fig.width=8, fig.height=5}
+ggplot2::ggplot(df2, ggplot2::aes(x = word_count)) +
+  ggplot2::geom_histogram(bins = 50) +
+  ggplot2::labs(
+    title = "Distribution of Review Word Count",
+    x = "Word Count",
+    y = "Frequency"
+  ) +
+  ggplot2::theme_minimal()
+```
+
+```{r eda-plots-5, fig.width=8, fig.height=5}
+ggplot2::ggplot(df2, ggplot2::aes(x = word_count)) +
+  ggplot2::geom_histogram(bins = 50) +
+  ggplot2::scale_x_log10() +
+  ggplot2::labs(
+    title = "Distribution of Review Word Count (Log Scale)",
+    x = "Word Count (log scale)",
+    y = "Frequency"
+  ) +
+  ggplot2::theme_minimal()
+```
+
+```{r eda-rating-summary}
+rating_length_summary <- df2 %>%
+  dplyr::group_by(Rating) %>%
+  dplyr::summarise(
+    avg_word_count = mean(word_count, na.rm = TRUE),
+    median_word_count = median(word_count, na.rm = TRUE),
+    avg_char_count = mean(char_count, na.rm = TRUE),
+    median_char_count = median(char_count, na.rm = TRUE),
+    recommend_rate = mean(`Recommended IND`, na.rm = TRUE),
+    n = dplyr::n(),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(Rating)
+
+rating_length_summary %>%
+  knitr::kable(caption = "Review Length and Recommendation by Rating")
+```
+
+```{r eda-plots-6, fig.width=8, fig.height=5}
+ggplot2::ggplot(df2, ggplot2::aes(x = factor(Rating), y = word_count)) +
+  ggplot2::geom_boxplot() +
+  ggplot2::coord_cartesian(ylim = quantile(df2$word_count, c(0, 0.95), na.rm = TRUE)) +
+  ggplot2::labs(
+    title = "Review Word Count by Rating",
+    x = "Rating",
+    y = "Word Count"
+  ) +
+  ggplot2::theme_minimal()
+```
+
+```{r eda-plots-7, fig.width=8, fig.height=5}
+ggplot2::ggplot(df2, ggplot2::aes(x = factor(Rating), fill = factor(`Recommended IND`))) +
+  ggplot2::geom_bar(position = "fill") +
+  ggplot2::scale_y_continuous(labels = scales::percent_format()) +
+  ggplot2::labs(
+    title = "Recommendation Rate by Rating",
+    x = "Rating",
+    y = "Proportion",
+    fill = "Recommended"
+  ) +
+  ggplot2::theme_minimal()
+```
+
+```{r eda-department-summary}
+department_summary_eda <- df2 %>%
+  dplyr::group_by(`Department Name`) %>%
+  dplyr::summarise(
+    avg_rating = mean(Rating, na.rm = TRUE),
+    recommend_rate = mean(`Recommended IND`, na.rm = TRUE),
+    avg_word_count = mean(word_count, na.rm = TRUE),
+    avg_char_count = mean(char_count, na.rm = TRUE),
+    avg_feedback = mean(`Positive Feedback Count`, na.rm = TRUE),
+    n = dplyr::n(),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(dplyr::desc(avg_rating))
+
+department_summary_eda %>%
+  knitr::kable(caption = "Department-Level Review Summary")
+```
+
+```{r eda-plots-10, fig.width=8, fig.height=6}
+rating_department_heatmap <- df2 %>%
+  dplyr::count(`Department Name`, Rating) %>%
+  dplyr::group_by(`Department Name`) %>%
+  dplyr::mutate(prop_within_department = n / sum(n)) %>%
+  dplyr::ungroup()
+
+ggplot2::ggplot(
+  rating_department_heatmap,
+  ggplot2::aes(
+    x = factor(Rating),
+    y = forcats::fct_reorder(`Department Name`, n, .fun = sum),
+    fill = prop_within_department
+  )
+) +
+  ggplot2::geom_tile() +
+  ggplot2::scale_fill_gradient(low = "white", high = "steelblue", labels = scales::percent_format()) +
+  ggplot2::labs(
+    title = "Rating Composition Within Each Department",
+    x = "Rating",
+    y = "Department",
+    fill = "Within-Dept %"
+  ) +
+  ggplot2::theme_minimal()
+```
+
+```{r eda-feedback-summary}
+feedback_by_length_bin <- df2 %>%
+  dplyr::mutate(
+    length_bin = dplyr::case_when(
+      word_count < 20 ~ "<20",
+      word_count < 50 ~ "20-49",
+      word_count < 100 ~ "50-99",
+      word_count < 200 ~ "100-199",
+      TRUE ~ "200+"
+    )
+  ) %>%
+  dplyr::group_by(length_bin) %>%
+  dplyr::summarise(
+    avg_feedback = mean(`Positive Feedback Count`, na.rm = TRUE),
+    avg_rating = mean(Rating, na.rm = TRUE),
+    n = dplyr::n(),
+    .groups = "drop"
+  )
+
+feedback_by_length_bin %>% knitr::kable(caption = "Average Feedback by Review-Length Bin")
+```
+
+```{r eda-plots-11, fig.width=8, fig.height=5}
+ggplot2::ggplot(df2, ggplot2::aes(x = word_count, y = `Positive Feedback Count`)) +
+  ggplot2::geom_point(alpha = 0.15) +
+  ggplot2::coord_cartesian(
+    xlim = quantile(df2$word_count, c(0, 0.99), na.rm = TRUE),
+    ylim = quantile(df2$`Positive Feedback Count`, c(0, 0.99), na.rm = TRUE)
+  ) +
+  ggplot2::labs(
+    title = "Review Length vs Positive Feedback Count",
+    x = "Word Count",
+    y = "Positive Feedback Count"
+  ) +
+  ggplot2::theme_minimal()
+```
+
+```{r eda-plots-12, fig.width=8, fig.height=5}
+ggplot2::ggplot(feedback_by_length_bin, ggplot2::aes(x = length_bin, y = avg_feedback)) +
+  ggplot2::geom_col() +
+  ggplot2::labs(
+    title = "Average Positive Feedback by Review-Length Bin",
+    x = "Review-Length Bin",
+    y = "Average Positive Feedback Count"
+  ) +
+  ggplot2::theme_minimal()
+```
+
+```{r prepare-clustering-data}
+df2 <- df2 %>%
+  dplyr::mutate(
+    review_id = as.character(review_id),
+    `Recommended IND` = as.integer(`Recommended IND`),
+    Rating = as.numeric(Rating),
+    `Positive Feedback Count` = as.numeric(`Positive Feedback Count`),
+    Age = as.numeric(Age),
+    `Department Name` = as.character(`Department Name`),
+    word_count = as.numeric(word_count),
+    char_count = as.numeric(char_count)
+  )
+
+clean_df <- clean_df %>%
+  dplyr::mutate(
+    review_id = as.character(review_id),
+    word = stringr::str_to_lower(as.character(word))
+  ) %>%
+  dplyr::filter(!is.na(review_id), !is.na(word), word != "")
+```
+
+```{r build-clean-df-fast}
+clothing_stop_words <- c(
+  "dress", "dresses", "shirt", "shirts", "top", "tops",
+  "sweater", "sweaters", "pant", "pants", "jean", "jeans",
+  "skirt", "skirts", "jacket", "jackets", "blouse", "blouses",
+  "cardigan", "cardigans", "leggings", "legging", "coat", "coats",
+  "bra", "bras", "robe", "robes", "tee", "tees", "tank", "tanks",
+  "jumpsuit", "jumpsuits", "shorts", "short", "item", "items",
+  "piece", "pieces", "clothes", "clothing", "garment", "garments", "sock", "socks"
+)
+
+generic_review_words <- c(
+  "wear", "wore", "buy", "bought", "order", "ordered"
+)
+
+clean_df_fast <- clean_df %>%
+  dplyr::filter(!word %in% c(clothing_stop_words, generic_review_words)) %>%
+  dplyr::filter(!stringr::str_detect(word, "[0-9]")) %>%
+  dplyr::filter(stringr::str_length(word) >= 3)
+```
+
+```{r define-helper-functions-1}
+build_tfidf_fast <- function(clean_df_fast,
+                             min_doc_freq = 15,
+                             max_doc_prop = 0.30) {
+  review_word_counts <- clean_df_fast %>%
+    dplyr::count(review_id, word, name = "n")
+
+  total_docs <- dplyr::n_distinct(review_word_counts$review_id)
+
+  vocab <- review_word_counts %>%
+    dplyr::group_by(word) %>%
+    dplyr::summarise(doc_n = dplyr::n_distinct(review_id), .groups = "drop") %>%
+    dplyr::mutate(doc_prop = doc_n / total_docs) %>%
+    dplyr::filter(doc_n >= min_doc_freq, doc_prop <= max_doc_prop)
+
+  tfidf_df <- review_word_counts %>%
+    dplyr::inner_join(vocab %>% dplyr::select(word), by = "word") %>%
+    tidytext::bind_tf_idf(term = word, document = review_id, n = n)
+
+  dtm <- tfidf_df %>%
+    tidytext::cast_sparse(row = review_id, column = word, value = tf_idf)
+
+  list(
+    dtm = dtm,
+    vocab = vocab
+  )
+}
+
+row_normalize_sparse <- function(m) {
+  row_norms <- sqrt(Matrix::rowSums(m ^ 2))
+  row_norms[row_norms == 0] <- 1
+  out <- Matrix::Diagonal(x = 1 / row_norms) %*% m
+  rownames(out) <- rownames(m)
+  colnames(out) <- colnames(m)
+  out
+}
+
+build_svd_features_fast <- function(dtm_norm, n_components = 40) {
+  svd_res <- irlba::irlba(dtm_norm, nv = n_components)
+  text_embed <- svd_res$u %*% diag(svd_res$d)
+  text_embed <- as.data.frame(text_embed)
+  colnames(text_embed) <- paste0("svd_", seq_len(ncol(text_embed)))
+  text_embed$review_id <- rownames(dtm_norm)
+
+  list(
+    svd_res = svd_res,
+    svd_df = text_embed
+  )
+}
+```
+
+```{r define-helper-functions-2}
+build_cluster_feature_df_fast <- function(df2_sub,
+                                          clean_df_sub,
+                                          min_doc_freq = 15,
+                                          max_doc_prop = 0.30,
+                                          n_components = 40) {
+  tfidf_obj <- build_tfidf_fast(
+    clean_df_fast = clean_df_sub,
+    min_doc_freq = min_doc_freq,
+    max_doc_prop = max_doc_prop
+  )
+
+  dtm_norm <- row_normalize_sparse(tfidf_obj$dtm)
+
+  svd_obj <- build_svd_features_fast(
+    dtm_norm = dtm_norm,
+    n_components = n_components
+  )
+
+  feature_df <- df2_sub %>%
+    dplyr::select(
+      review_id,
+      Rating,
+      `Recommended IND`,
+      `Positive Feedback Count`,
+      Age,
+      `Department Name`,
+      word_count,
+      char_count
+    ) %>%
+    dplyr::left_join(svd_obj$svd_df, by = "review_id")
+
+  numeric_fill_cols <- setdiff(names(feature_df), c("review_id", "Department Name"))
+
+  feature_df <- feature_df %>%
+    dplyr::mutate(dplyr::across(dplyr::all_of(numeric_fill_cols), ~ tidyr::replace_na(.x, 0)))
+
+  list(
+    feature_df = feature_df,
+    tfidf_obj = tfidf_obj,
+    svd_obj = svd_obj
+  )
+}
+
+get_cluster_input_text_only <- function(feature_df) {
+  cluster_vars <- grep("^svd_", names(feature_df), value = TRUE)
+
+  mat_df <- feature_df %>%
+    dplyr::select(review_id, dplyr::all_of(cluster_vars)) %>%
+    tidyr::drop_na()
+
+  numeric_mat <- mat_df %>%
+    dplyr::select(-review_id)
+
+  scaled_mat <- scale(numeric_mat)
+
+  list(
+    review_ids = mat_df$review_id,
+    scaled_mat = scaled_mat
+  )
+}
+```
+
+```{r define-helper-functions-3}
+run_full_once <- function(df2,
+                          clean_df_fast,
+                          chosen_k = 5,
+                          min_doc_freq = 15,
+                          max_doc_prop = 0.30,
+                          n_components = 40,
+                          nstart = 25,
+                          seed = 123) {
+  feature_obj <- build_cluster_feature_df_fast(
+    df2_sub = df2,
+    clean_df_sub = clean_df_fast,
+    min_doc_freq = min_doc_freq,
+    max_doc_prop = max_doc_prop,
+    n_components = n_components
+  )
+
+  cluster_input <- get_cluster_input_text_only(feature_obj$feature_df)
+
+  set.seed(seed + chosen_k)
+  km <- stats::kmeans(cluster_input$scaled_mat, centers = chosen_k, nstart = nstart)
+
+  cluster_df <- tibble::tibble(
+    review_id = cluster_input$review_ids,
+    review_type = factor(km$cluster)
+  )
+
+  clustered_df <- feature_obj$feature_df %>%
+    dplyr::left_join(cluster_df, by = "review_id") %>%
+    dplyr::mutate(review_type = factor(review_type))
+
+  list(
+    chosen_k = chosen_k,
+    feature_obj = feature_obj,
+    cluster_input = cluster_input,
+    kmeans = km,
+    cluster_df = cluster_df,
+    clustered_df = clustered_df
+  )
+}
+
+build_distinctive_words_fast <- function(clustered_df, clean_df_fast, min_count = 20, top_n = 12) {
+  cluster_word_counts <- clean_df_fast %>%
+    dplyr::inner_join(
+      clustered_df %>% dplyr::select(review_id, review_type),
+      by = "review_id"
+    ) %>%
+    dplyr::count(review_type, word, name = "n_cluster")
+
+  cluster_sizes <- clustered_df %>%
+    dplyr::count(review_type, name = "reviews_in_type")
+
+  total_reviews <- nrow(clustered_df)
+
+  cluster_vs_rest <- cluster_word_counts %>%
+    dplyr::group_by(word) %>%
+    dplyr::mutate(n_rest = sum(n_cluster) - n_cluster) %>%
+    dplyr::ungroup() %>%
+    dplyr::left_join(cluster_sizes, by = "review_type") %>%
+    dplyr::mutate(
+      reviews_rest = total_reviews - reviews_in_type,
+      p_cluster = (n_cluster + 0.5) / (reviews_in_type + 1),
+      p_rest = (n_rest + 0.5) / (reviews_rest + 1),
+      log_odds = log(p_cluster / (1 - p_cluster)) - log(p_rest / (1 - p_rest))
+    ) %>%
+    dplyr::filter(n_cluster >= min_count)
+
+  top_distinctive_words <- cluster_vs_rest %>%
+    dplyr::group_by(review_type) %>%
+    dplyr::slice_max(order_by = log_odds, n = top_n, with_ties = FALSE) %>%
+    dplyr::ungroup()
+
+  cluster_labels_table <- top_distinctive_words %>%
+    dplyr::group_by(review_type) %>%
+    dplyr::summarise(
+      distinctive_words = paste(word, collapse = ", "),
+      .groups = "drop"
+    )
+
+  list(
+    top_distinctive_words = top_distinctive_words,
+    cluster_labels_table = cluster_labels_table
+  )
+}
+```
+
+```{r define-helper-functions-4}
+summarize_one_k <- function(full_obj, clean_df_fast) {
+  clustered_df <- full_obj$clustered_df
+  chosen_k <- full_obj$chosen_k
+
+  cluster_summary_table <- clustered_df %>%
+    dplyr::group_by(review_type) %>%
+    dplyr::summarise(
+      n = dplyr::n(),
+      proportion = n / nrow(clustered_df),
+      recommend_rate = mean(`Recommended IND`, na.rm = TRUE),
+      avg_rating = mean(Rating, na.rm = TRUE),
+      median_rating = median(Rating, na.rm = TRUE),
+      avg_feedback = mean(`Positive Feedback Count`, na.rm = TRUE),
+      median_feedback = median(`Positive Feedback Count`, na.rm = TRUE),
+      avg_age = mean(Age, na.rm = TRUE),
+      median_age = median(Age, na.rm = TRUE),
+      avg_word_count = mean(word_count, na.rm = TRUE),
+      median_word_count = median(word_count, na.rm = TRUE),
+      avg_char_count = mean(char_count, na.rm = TRUE),
+      median_char_count = median(char_count, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::arrange(review_type) %>%
+    dplyr::mutate(k = chosen_k)
+
+  cluster_department_table <- clustered_df %>%
+    dplyr::count(review_type, `Department Name`) %>%
+    dplyr::group_by(review_type) %>%
+    dplyr::mutate(prop_within_cluster = n / sum(n)) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(k = chosen_k)
+
+  distinctive_word_obj <- build_distinctive_words_fast(
+    clustered_df = clustered_df,
+    clean_df_fast = clean_df_fast,
+    min_count = 20,
+    top_n = 12
+  )
+
+  cluster_summary_table <- cluster_summary_table %>%
+    dplyr::left_join(
+      distinctive_word_obj$cluster_labels_table,
+      by = "review_type"
+    )
+
+  list(
+    cluster_summary_table = cluster_summary_table,
+    cluster_department_table = cluster_department_table,
+    top_distinctive_words = distinctive_word_obj$top_distinctive_words
+  )
+}
+```
+
+```{r define-helper-functions-5}
+plot_one_k <- function(full_obj, summary_obj) {
+  clustered_df <- full_obj$clustered_df
+  chosen_k <- full_obj$chosen_k
+  cluster_summary_table <- summary_obj$cluster_summary_table
+  cluster_department_table <- summary_obj$cluster_department_table
+  top_distinctive_words <- summary_obj$top_distinctive_words
+
+  p_cluster_summary <- ggplot2::ggplot(
+    cluster_summary_table,
+    ggplot2::aes(
+      x = recommend_rate,
+      y = avg_rating,
+      size = n,
+      color = review_type,
+      label = paste("Type", review_type)
+    )
+  ) +
+    ggplot2::geom_point(alpha = 0.85) +
+    ggplot2::geom_text(nudge_y = 0.03, show.legend = FALSE, fontface = "bold") +
+    ggplot2::scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+    ggplot2::labs(
+      title = paste("Review Types by Recommendation Rate and Average Rating (k =", chosen_k, ")"),
+      subtitle = "Bubble size reflects the number of reviews in each cluster",
+      x = "Recommendation Rate",
+      y = "Average Rating",
+      size = "Number of Reviews",
+      color = "Review Type"
+    ) +
+    ggplot2::theme_minimal(base_size = 12) +
+    ggplot2::theme(plot.title = ggplot2::element_text(face = "bold"))
+
+  heatmap_df <- cluster_summary_table %>%
+    dplyr::select(
+      review_type,
+      recommend_rate,
+      avg_rating,
+      avg_feedback,
+      avg_age,
+      avg_word_count,
+      avg_char_count
+    ) %>%
+    tidyr::pivot_longer(
+      cols = -review_type,
+      names_to = "feature",
+      values_to = "value"
+    ) %>%
+    dplyr::group_by(feature) %>%
+    dplyr::mutate(z_value = as.numeric(scale(value))) %>%
+    dplyr::ungroup()
+
+  p_cluster_heatmap <- ggplot2::ggplot(heatmap_df, ggplot2::aes(x = feature, y = review_type, fill = z_value)) +
+    ggplot2::geom_tile(color = "white") +
+    ggplot2::geom_text(ggplot2::aes(label = round(value, 2)), size = 3) +
+    ggplot2::labs(
+      title = paste("Cluster Feature Heatmap (k =", chosen_k, ")"),
+      subtitle = "Colors show standardized differences across clusters",
+      x = "Feature",
+      y = "Review Type",
+      fill = "Z-score"
+    ) +
+    ggplot2::theme_minimal(base_size = 12) +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(face = "bold"),
+      axis.text.x = ggplot2::element_text(angle = 35, hjust = 1)
+    )
+
+  distinctive_plot_df <- top_distinctive_words %>%
+    dplyr::mutate(word = tidytext::reorder_within(word, log_odds, review_type))
+
+  p_distinctive_words <- ggplot2::ggplot(
+    distinctive_plot_df,
+    ggplot2::aes(x = log_odds, y = word, fill = review_type)
+  ) +
+    ggplot2::geom_col(show.legend = FALSE) +
+    tidytext::scale_y_reordered() +
+    ggplot2::facet_wrap(~ review_type, scales = "free_y") +
+    ggplot2::labs(
+      title = paste("Distinctive Words by Review Type (k =", chosen_k, ")"),
+      subtitle = "Words are ranked by cluster-vs-rest log-odds",
+      x = "Distinctiveness (log-odds vs. rest)",
+      y = NULL
+    ) +
+    ggplot2::theme_minimal(base_size = 12) +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(face = "bold"),
+      strip.text = ggplot2::element_text(face = "bold")
+    )
+
+  dept_plot_df <- cluster_department_table %>%
+    dplyr::mutate(`Department Name` = forcats::fct_lump_n(`Department Name`, n = 6))
+
+  p_department_cluster <- ggplot2::ggplot(
+    dept_plot_df,
+    ggplot2::aes(x = review_type, y = prop_within_cluster, fill = `Department Name`)
+  ) +
+    ggplot2::geom_col(position = "fill") +
+    ggplot2::scale_y_continuous(labels = scales::percent_format()) +
+    ggplot2::labs(
+      title = paste("Department Composition Within Review Types (k =", chosen_k, ")"),
+      subtitle = "Checks whether clusters are still dominated by product category",
+      x = "Review Type",
+      y = "Proportion Within Review Type",
+      fill = "Department"
+    ) +
+    ggplot2::theme_minimal(base_size = 12) +
+    ggplot2::theme(plot.title = ggplot2::element_text(face = "bold"))
+
+  p_wordcount_cluster <- ggplot2::ggplot(
+    clustered_df,
+    ggplot2::aes(x = review_type, y = word_count, fill = review_type)
+  ) +
+    ggplot2::geom_boxplot(show.legend = FALSE) +
+    ggplot2::coord_cartesian(ylim = quantile(clustered_df$word_count, c(0, 0.95), na.rm = TRUE)) +
+    ggplot2::labs(
+      title = paste("Review Word Count by Review Type (k =", chosen_k, ")"),
+      x = "Review Type",
+      y = "Word Count"
+    ) +
+    ggplot2::theme_minimal(base_size = 12) +
+    ggplot2::theme(plot.title = ggplot2::element_text(face = "bold"))
+
+  p_recommend_cluster <- ggplot2::ggplot(
+    clustered_df,
+    ggplot2::aes(x = review_type, fill = factor(`Recommended IND`))
+  ) +
+    ggplot2::geom_bar(position = "fill") +
+    ggplot2::scale_y_continuous(labels = scales::percent_format()) +
+    ggplot2::labs(
+      title = paste("Recommendation Composition Within Review Types (k =", chosen_k, ")"),
+      x = "Review Type",
+      y = "Proportion",
+      fill = "Recommended"
+    ) +
+    ggplot2::theme_minimal(base_size = 12) +
+    ggplot2::theme(plot.title = ggplot2::element_text(face = "bold"))
+
+  list(
+    cluster_summary = p_cluster_summary,
+    cluster_heatmap = p_cluster_heatmap,
+    distinctive_words = p_distinctive_words,
+    department_cluster = p_department_cluster,
+    wordcount_cluster = p_wordcount_cluster,
+    recommend_cluster = p_recommend_cluster
+  )
+}
+```
+
+```{r run-clustering}
+k_values <- 3:7
+
+multi_k_full <- lapply(k_values, function(k) {
+  full_obj <- run_full_once(
+    df2 = df2,
+    clean_df_fast = clean_df_fast,
+    chosen_k = k,
+    min_doc_freq = 15,
+    max_doc_prop = 0.30,
+    n_components = 40,
+    nstart = 25,
+    seed = 123
+  )
+
+  summary_obj <- summarize_one_k(full_obj, clean_df_fast)
+  plot_obj <- plot_one_k(full_obj, summary_obj)
+
+  list(
+    full_obj = full_obj,
+    summary_obj = summary_obj,
+    plot_obj = plot_obj
+  )
+})
+
+names(multi_k_full) <- paste0("k_", k_values)
+
+all_cluster_summaries <- dplyr::bind_rows(
+  lapply(multi_k_full, function(x) x$summary_obj$cluster_summary_table)
+)
+
+all_cluster_departments <- dplyr::bind_rows(
+  lapply(multi_k_full, function(x) x$summary_obj$cluster_department_table)
+)
+
+all_distinctive_words <- dplyr::bind_rows(
+  lapply(multi_k_full, function(x) {
+    x$summary_obj$top_distinctive_words %>%
+      dplyr::mutate(k = unique(x$summary_obj$cluster_summary_table$k))
+  })
+)
+
+```
+
+```{r cluster-plots, fig.width=10, fig.height=6}
+for (k_name in names(multi_k_full)) {
+  print(multi_k_full[[k_name]]$plot_obj$cluster_summary)
+  print(multi_k_full[[k_name]]$plot_obj$cluster_heatmap)
+  print(multi_k_full[[k_name]]$plot_obj$distinctive_words)
+  print(multi_k_full[[k_name]]$plot_obj$department_cluster)
+  print(multi_k_full[[k_name]]$plot_obj$wordcount_cluster)
+  print(multi_k_full[[k_name]]$plot_obj$recommend_cluster)
+}
+```
+
+
+
+```{r}
+#NEW STUFF
+```
+
+```{r recommendation-logreg-train-test-helpers}
+set.seed(42)
+
+build_train_tfidf_for_logreg <- function(clean_train,
+                                          min_doc_freq = 15,
+                                          max_doc_prop = 0.30) {
+  clean_train <- clean_train %>%
+    dplyr::mutate(review_id = as.character(review_id))
+
+  review_word_counts <- clean_train %>%
+    dplyr::count(review_id, word, name = "n")
+
+  total_docs <- dplyr::n_distinct(review_word_counts$review_id)
+
+  vocab <- review_word_counts %>%
+    dplyr::group_by(word) %>%
+    dplyr::summarise(
+      doc_n = dplyr::n_distinct(review_id),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      doc_prop = doc_n / total_docs,
+      idf = log(total_docs / doc_n)
+    ) %>%
+    dplyr::filter(
+      doc_n >= min_doc_freq,
+      doc_prop <= max_doc_prop
+    )
+
+  tfidf_df <- review_word_counts %>%
+    dplyr::inner_join(vocab %>% dplyr::select(word, idf), by = "word") %>%
+    dplyr::group_by(review_id) %>%
+    dplyr::mutate(
+      total_words = sum(n),
+      tf = n / total_words,
+      tf_idf = tf * idf
+    ) %>%
+    dplyr::ungroup()
+
+  dtm <- tfidf_df %>%
+    tidytext::cast_sparse(row = review_id, column = word, value = tf_idf)
+
+  list(
+    dtm = dtm,
+    vocab = vocab
+  )
+}
+
+transform_tfidf_for_logreg <- function(clean_new, train_vocab) {
+  clean_new <- clean_new %>%
+    dplyr::mutate(review_id = as.character(review_id))
+
+  review_word_counts <- clean_new %>%
+    dplyr::count(review_id, word, name = "n")
+
+  tfidf_df <- review_word_counts %>%
+    dplyr::inner_join(
+      train_vocab %>% dplyr::select(word, idf),
+      by = "word"
+    ) %>%
+    dplyr::group_by(review_id) %>%
+    dplyr::mutate(
+      total_words = sum(n),
+      tf = n / total_words,
+      tf_idf = tf * idf
+    ) %>%
+    dplyr::ungroup()
+
+  if (nrow(tfidf_df) == 0) {
+    return(Matrix::Matrix(
+      0,
+      nrow = 0,
+      ncol = nrow(train_vocab),
+      sparse = TRUE,
+      dimnames = list(character(), train_vocab$word)
+    ))
+  }
+
+  tfidf_df %>%
+    tidytext::cast_sparse(row = review_id, column = word, value = tf_idf)
+}
+
+align_sparse_matrix <- function(dtm, row_ids, col_words) {
+  row_ids <- as.character(row_ids)
+
+  aligned <- Matrix::Matrix(
+    0,
+    nrow = length(row_ids),
+    ncol = length(col_words),
+    sparse = TRUE,
+    dimnames = list(row_ids, col_words)
+  )
+
+  common_rows <- intersect(rownames(dtm), row_ids)
+  common_cols <- intersect(colnames(dtm), col_words)
+
+  if (length(common_rows) > 0 && length(common_cols) > 0) {
+    aligned[common_rows, common_cols] <- dtm[common_rows, common_cols]
+  }
+
+  aligned
+}
+
+make_svd_df <- function(dtm_norm, svd_v, prefix = "svd_") {
+  svd_scores <- as.matrix(dtm_norm %*% svd_v)
+  svd_scores <- as.data.frame(svd_scores)
+
+  colnames(svd_scores) <- paste0(prefix, seq_len(ncol(svd_scores)))
+  svd_scores$review_id <- rownames(dtm_norm)
+
+  svd_scores
+}
+```
+
+```{r}
+logreg_base_df <- df2 %>%
+  dplyr::mutate(review_id = as.character(review_id)) %>%
+  dplyr::select(
+    review_id,
+    `Recommended IND`,
+    char_count
+  ) %>%
+  tidyr::drop_na(`Recommended IND`, char_count)
+
+set.seed(42)
+
+train_ids <- logreg_base_df %>%
+  dplyr::group_by(`Recommended IND`) %>%
+  dplyr::slice_sample(prop = 0.80) %>%
+  dplyr::ungroup() %>%
+  dplyr::pull(review_id)
+
+test_ids <- setdiff(logreg_base_df$review_id, train_ids)
+
+train_base_df <- logreg_base_df %>%
+  dplyr::filter(review_id %in% train_ids)
+
+test_base_df <- logreg_base_df %>%
+  dplyr::filter(review_id %in% test_ids)
+
+clean_train <- clean_df_fast %>%
+  dplyr::mutate(review_id = as.character(review_id)) %>%
+  dplyr::filter(review_id %in% train_ids)
+
+clean_test <- clean_df_fast %>%
+  dplyr::mutate(review_id = as.character(review_id)) %>%
+  dplyr::filter(review_id %in% test_ids)
+
+split_check <- tibble::tibble(
+  split = c("Train", "Test"),
+  n_reviews = c(nrow(train_base_df), nrow(test_base_df)),
+  recommended_rate = c(
+    mean(train_base_df$`Recommended IND`),
+    mean(test_base_df$`Recommended IND`)
+  )
+)
+
+print(split_check)
+```
+
+```{r}
+n_components <- 40
+
+train_tfidf_obj <- build_train_tfidf_for_logreg(
+  clean_train = clean_train,
+  min_doc_freq = 15,
+  max_doc_prop = 0.30
+)
+
+train_vocab <- train_tfidf_obj$vocab
+
+train_dtm <- align_sparse_matrix(
+  dtm = train_tfidf_obj$dtm,
+  row_ids = train_base_df$review_id,
+  col_words = train_vocab$word
+)
+
+test_dtm_raw <- transform_tfidf_for_logreg(
+  clean_new = clean_test,
+  train_vocab = train_vocab
+)
+
+test_dtm <- align_sparse_matrix(
+  dtm = test_dtm_raw,
+  row_ids = test_base_df$review_id,
+  col_words = train_vocab$word
+)
+
+train_dtm_norm <- row_normalize_sparse(train_dtm)
+test_dtm_norm <- row_normalize_sparse(test_dtm)
+
+n_components_use <- min(
+  n_components,
+  nrow(train_dtm_norm) - 1,
+  ncol(train_dtm_norm) - 1
+)
+
+if (n_components_use < 2) {
+  stop("Not enough rows or vocabulary terms to fit SVD.")
+}
+
+svd_res <- irlba::irlba(
+  train_dtm_norm,
+  nv = n_components_use
+)
+
+train_svd_df <- make_svd_df(
+  dtm_norm = train_dtm_norm,
+  svd_v = svd_res$v
+)
+
+test_svd_df <- make_svd_df(
+  dtm_norm = test_dtm_norm,
+  svd_v = svd_res$v
+)
+
+train_logreg_df <- train_base_df %>%
+  dplyr::left_join(train_svd_df, by = "review_id")
+
+test_logreg_df <- test_base_df %>%
+  dplyr::left_join(test_svd_df, by = "review_id")
+
+svd_cols <- grep("^svd_", names(train_logreg_df), value = TRUE)
+
+train_logreg_df <- train_logreg_df %>%
+  tidyr::drop_na(`Recommended IND`, char_count, dplyr::all_of(svd_cols))
+
+test_logreg_df <- test_logreg_df %>%
+  tidyr::drop_na(`Recommended IND`, char_count, dplyr::all_of(svd_cols))
+```
+
+```{r}
+svd_formula <- as.formula(
+  paste("`Recommended IND` ~ char_count +", paste(svd_cols, collapse = " + "))
+)
+
+svd_glm <- stats::glm(
+  svd_formula,
+  data = train_logreg_df,
+  family = stats::binomial()
+)
+
+cat("\n========================================\n")
+cat("LOGISTIC REGRESSION USING TRAINING SET ONLY\n")
+cat("========================================\n")
+print(summary(svd_glm))
+
+svd_glm_results <- broom::tidy(svd_glm, conf.int = TRUE) %>%
+  dplyr::mutate(
+    odds_ratio = exp(estimate),
+    conf.low.or = exp(conf.low),
+    conf.high.or = exp(conf.high)
+  )
+
+cat("\n========================================\n")
+cat("TIDY LOGISTIC REGRESSION RESULTS FROM TRAINING MODEL\n")
+cat("========================================\n")
+print(svd_glm_results, width = Inf)
+```
+
+```{r}
+test_logreg_df <- test_logreg_df %>%
+  dplyr::mutate(
+    predicted_prob = stats::predict(
+      svd_glm,
+      newdata = test_logreg_df,
+      type = "response"
+    ),
+    predicted_class = dplyr::if_else(predicted_prob >= 0.5, 1L, 0L)
+  )
+
+conf_mat_df <- test_logreg_df %>%
+  dplyr::mutate(actual_class = as.integer(`Recommended IND`)) %>%
+  dplyr::count(actual_class, predicted_class, name = "n") %>%
+  tidyr::complete(
+    actual_class = c(0L, 1L),
+    predicted_class = c(0L, 1L),
+    fill = list(n = 0)
+  )
+```
+
+```{r}
+p_confusion <- ggplot2::ggplot(
+  conf_mat_df,
+  ggplot2::aes(
+    x = factor(predicted_class),
+    y = factor(actual_class),
+    fill = n
+  )
+) +
+  ggplot2::geom_tile(color = "white") +
+  ggplot2::geom_text(
+    ggplot2::aes(label = n),
+    size = 6,
+    fontface = "bold"
+  ) +
+  ggplot2::scale_fill_gradient(low = "white", high = "steelblue") +
+  ggplot2::labs(
+    title = "Confusion Matrix: Test Set Logistic Regression Using SVD Features",
+    x = "Predicted Class",
+    y = "Actual Class",
+    fill = "Count"
+  ) +
+  ggplot2::theme_minimal(base_size = 12) +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(face = "bold")
+  )
+
+print(p_confusion)
+```
+
+```{r}
+tn <- conf_mat_df %>%
+  dplyr::filter(actual_class == 0, predicted_class == 0) %>%
+  dplyr::pull(n)
+
+fp <- conf_mat_df %>%
+  dplyr::filter(actual_class == 0, predicted_class == 1) %>%
+  dplyr::pull(n)
+
+fn <- conf_mat_df %>%
+  dplyr::filter(actual_class == 1, predicted_class == 0) %>%
+  dplyr::pull(n)
+
+tp <- conf_mat_df %>%
+  dplyr::filter(actual_class == 1, predicted_class == 1) %>%
+  dplyr::pull(n)
+
+accuracy <- (tp + tn) / (tp + tn + fp + fn)
+
+precision <- ifelse(
+  (tp + fp) == 0,
+  NA,
+  tp / (tp + fp)
+)
+
+recall <- ifelse(
+  (tp + fn) == 0,
+  NA,
+  tp / (tp + fn)
+)
+
+specificity <- ifelse(
+  (tn + fp) == 0,
+  NA,
+  tn / (tn + fp)
+)
+
+f1 <- ifelse(
+  is.na(precision) | is.na(recall) | (precision + recall) == 0,
+  NA,
+  2 * precision * recall / (precision + recall)
+)
+```
+
+```{r}
+svd_predictions_df <- df2 %>%
+  dplyr::mutate(review_id = as.character(review_id)) %>%
+  dplyr::left_join(
+    test_logreg_df %>%
+      dplyr::select(review_id, predicted_prob, predicted_class),
+    by = "review_id"
+  )
+
+top_positive_reviews <- svd_predictions_df %>%
+  dplyr::filter(!is.na(predicted_prob)) %>%
+  dplyr::select(review_id, `Review Text`, predicted_prob, `Recommended IND`) %>%
+  dplyr::arrange(dplyr::desc(predicted_prob)) %>%
+  dplyr::slice_head(n = 15)
+
+top_negative_reviews <- svd_predictions_df %>%
+  dplyr::filter(!is.na(predicted_prob)) %>%
+  dplyr::select(review_id, `Review Text`, predicted_prob, `Recommended IND`) %>%
+  dplyr::arrange(predicted_prob) %>%
+  dplyr::slice_head(n = 15)
+
+cat("\n========================================\n")
+cat("TOP POSITIVELY PREDICTED TEST REVIEWS\n")
+cat("========================================\n")
+print(top_positive_reviews, n = 15)
+
+cat("\n========================================\n")
+cat("TOP NEGATIVELY PREDICTED TEST REVIEWS\n")
+cat("========================================\n")
+print(top_negative_reviews, n = 15)
+```
+
+```{r recommendation-logreg-important-svd-dimensions}
+important_svd_dims <- svd_glm_results %>%
+  dplyr::filter(stringr::str_detect(term, "^svd_")) %>%
+  dplyr::mutate(
+    abs_estimate = abs(estimate),
+    direction = dplyr::case_when(
+      estimate > 0 ~ "Positive association with recommendation",
+      estimate < 0 ~ "Negative association with recommendation",
+      TRUE ~ "No association"
+    )
+  ) %>%
+  dplyr::arrange(dplyr::desc(abs_estimate)) %>%
+  dplyr::slice_head(n = 8)
+
+important_svd_dims %>%
+  dplyr::select(
+    dimension = term,
+    estimate,
+    odds_ratio,
+    p.value,
+    direction
+  ) %>%
+  knitr::kable(
+    digits = 4,
+    caption = "Most Important SVD Dimensions in the Train-Test Logistic Regression Model"
+  )
+```
+
+```{r recommendation-logreg-interpret-svd-helper}
+interpret_svd_dimension_train <- function(dimension_name,
+                                          train_logreg_df,
+                                          clean_train,
+                                          top_prop = 0.10,
+                                          min_count = 5,
+                                          top_n = 15) {
+  dimension_scores <- train_logreg_df %>%
+    dplyr::select(review_id, score = dplyr::all_of(dimension_name)) %>%
+    dplyr::filter(!is.na(score))
+
+  low_cutoff <- stats::quantile(dimension_scores$score, top_prop, na.rm = TRUE)
+  high_cutoff <- stats::quantile(dimension_scores$score, 1 - top_prop, na.rm = TRUE)
+
+  dimension_groups <- dimension_scores %>%
+    dplyr::mutate(
+      side = dplyr::case_when(
+        score <= low_cutoff ~ "Low side",
+        score >= high_cutoff ~ "High side",
+        TRUE ~ NA_character_
+      )
+    ) %>%
+    dplyr::filter(!is.na(side))
+
+  side_sizes <- dimension_groups %>%
+    dplyr::count(side, name = "reviews_in_side")
+
+  total_reviews <- nrow(dimension_groups)
+
+  word_counts <- clean_train %>%
+    dplyr::inner_join(
+      dimension_groups %>% dplyr::select(review_id, side),
+      by = "review_id"
+    ) %>%
+    dplyr::count(side, word, name = "n_side")
+
+  side_vs_rest <- word_counts %>%
+    dplyr::group_by(word) %>%
+    dplyr::mutate(n_rest = sum(n_side) - n_side) %>%
+    dplyr::ungroup() %>%
+    dplyr::left_join(side_sizes, by = "side") %>%
+    dplyr::mutate(
+      reviews_rest = total_reviews - reviews_in_side,
+      p_side = (n_side + 0.5) / (reviews_in_side + 1),
+      p_rest = (n_rest + 0.5) / (reviews_rest + 1),
+      log_odds = log(p_side / (1 - p_side)) - log(p_rest / (1 - p_rest))
+    ) %>%
+    dplyr::filter(n_side >= min_count)
+
+  top_words <- side_vs_rest %>%
+    dplyr::group_by(side) %>%
+    dplyr::slice_max(order_by = log_odds, n = top_n, with_ties = FALSE) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(dimension = dimension_name) %>%
+    dplyr::select(dimension, side, word, n_side, log_odds)
+
+  example_reviews <- dimension_groups %>%
+    dplyr::group_by(side) %>%
+    dplyr::slice_max(order_by = abs(score), n = 5, with_ties = FALSE) %>%
+    dplyr::ungroup() %>%
+    dplyr::left_join(
+      df2 %>%
+        dplyr::select(review_id, `Review Text`, Rating, `Recommended IND`),
+      by = "review_id"
+    ) %>%
+    dplyr::mutate(dimension = dimension_name) %>%
+    dplyr::select(
+      dimension,
+      side,
+      review_id,
+      score,
+      Rating,
+      `Recommended IND`,
+      `Review Text`
+    )
+
+  list(
+    top_words = top_words,
+    example_reviews = example_reviews
+  )
+}
+```
+
+```{r recommendation-logreg-run-svd-interpretation}
+important_dimension_names <- important_svd_dims$term
+
+svd_interpretation_list <- lapply(
+  important_dimension_names,
+  interpret_svd_dimension_train,
+  train_logreg_df = train_logreg_df,
+  clean_train = clean_train,
+  top_prop = 0.10,
+  min_count = 5,
+  top_n = 15
+)
+
+names(svd_interpretation_list) <- important_dimension_names
+
+svd_interpretation_words <- dplyr::bind_rows(
+  lapply(svd_interpretation_list, function(x) x$top_words)
+)
+
+svd_interpretation_examples <- dplyr::bind_rows(
+  lapply(svd_interpretation_list, function(x) x$example_reviews)
+)
+
+svd_interpretation_words %>%
+  dplyr::arrange(dimension, side, dplyr::desc(log_odds)) %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Distinctive Words on the High and Low Ends of Important SVD Dimensions"
+  )
+```
+
+```{r recommendation-logreg-svd-word-summary-table}
+svd_word_summary <- svd_interpretation_words %>%
+  dplyr::group_by(dimension, side) %>%
+  dplyr::arrange(dplyr::desc(log_odds), .by_group = TRUE) %>%
+  dplyr::summarise(
+    distinctive_words = paste(head(word, 10), collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  tidyr::pivot_wider(
+    names_from = side,
+    values_from = distinctive_words
+  ) %>%
+  dplyr::left_join(
+    important_svd_dims %>%
+      dplyr::select(
+        dimension = term,
+        estimate,
+        odds_ratio,
+        direction
+      ),
+    by = "dimension"
+  ) %>%
+  dplyr::arrange(dplyr::desc(abs(estimate)))
+
+svd_word_summary %>%
+  knitr::kable(
+    digits = 4,
+    caption = "Human-Readable Word Patterns for Important SVD Dimensions"
+  )
+```
+
+```{r recommendation-logreg-svd-example-reviews}
+svd_interpretation_examples %>%
+  dplyr::arrange(dimension, side, dplyr::desc(abs(score))) %>%
+  dplyr::mutate(
+    short_review = stringr::str_trunc(`Review Text`, width = 220)
+  ) %>%
+  dplyr::select(
+    dimension,
+    side,
+    score,
+    Rating,
+    `Recommended IND`,
+    short_review
+  ) %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Example Reviews from the High and Low Ends of Important SVD Dimensions"
+  )
+```
+
+```{r}
+
+```
