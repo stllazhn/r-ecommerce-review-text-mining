@@ -6,12 +6,8 @@ The analysis explores customer review text, ratings, recommendation behavior, an
 
 ## Files
 
-```text
-r-ecommerce-review-text-mining/
-├── README.md
-├── clothing_review_analysis.qmd
-└── report.pdf
-```
+- [Read the full report as PDF](./R Project Report.pdf)
+- [Download the editable Word version](./R Project Report.docx)
 
 ## Data
 
