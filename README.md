@@ -6,8 +6,8 @@ The analysis explores customer review text, ratings, recommendation behavior, an
 
 ## Files
 
-- [Read the full report as PDF](./R Project Report.pdf)
-- [Download the editable Word version](./R Project Report.docx)
+- [Read the full report as PDF](./R_Project_Report.pdf)
+- [Download the editable Word version](./R_Project_Report.docx)
 
 ## Data
 
